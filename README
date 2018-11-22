@@ -1,3 +1,10 @@
 Run getSandP.py once first for downloading CSV
+Run merge.sh
 
 Run predict_snp500.py <- This is where our code will go
+
+
+
+References:
+	Data visualization:
+		https://www.kaggle.com/sdksci/s-p-500-plotting-with-detailed-notes-for-novices
