@@ -2,6 +2,10 @@ import pandas as pd
 import numpy as np
 import glob
 import functools
+import plotly.graph_objs as go
+import plotly.offline as offl
+
+
 
 #Display percent of null values
 def printNumMissing(allstockdata):
@@ -9,6 +13,19 @@ def printNumMissing(allstockdata):
     percentmissing = (nummissing.sort_values(ascending=False)/allstockdata.count())*100
     missinganalysis = pd.concat([nummissing, percentmissing], axis=1, keys=["Total items missing", "Percent"])
     print(missinganalysis)
+
+#Plot close data of ticker name
+def plotTicker(tickers, allstockdata):
+    traces = []
+
+    for ticker in tickers.split(","):
+       stockdata = allstockdata[allstockdata.Name == ticker]
+       traces += [go.Scatter(x=stockdata.date, y=stockdata.close, name=ticker)]
+
+    layout = dict(title="Closing price vs date" )
+    fig = dict(data=traces, layout=layout)
+    offl.plot(fig)
+    
 
 stockinfo = {}
 
@@ -32,3 +49,5 @@ for colname in allstockdata.columns.values:
 
 print ("Checking that all missing data has been removed. Dataframe size:", allstockdata.shape[0])
 printNumMissing(allstockdata)
+
+plotTicker("GOOG,AAL", allstockdata)
