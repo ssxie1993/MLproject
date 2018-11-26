@@ -8,3 +8,7 @@ Run predict_snp500.py <- This is where our code will go
 References:
 	Data visualization:
 		https://www.kaggle.com/sdksci/s-p-500-plotting-with-detailed-notes-for-novices
+	Plotting:
+		https://www.kaggle.com/hakkisimsek/plotly-tutorial-3
+	LSTM:
+		https://www.datacamp.com/community/tutorials/lstm-python-stock-market
