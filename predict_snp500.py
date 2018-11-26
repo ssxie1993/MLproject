@@ -52,20 +52,20 @@ stockdata = allstockdata[allstockdata.Name == "AAPL"]
 #allstockdata = pd.read_csv("./stockinfo/AAPL_data.csv")
 #print (allstockdata)
 
-print ("Analyzing all missing stock data. Dataframe size:", allstockdata.shape[0])
-printNumMissing(allstockdata)
+print ("Analyzing all missing stock data. Dataframe size:", stockdata.shape[0])
+printNumMissing(stockdata)
 
 
 #drops indexes of all stock data that shows null
-for colname in allstockdata.columns.values:
-    allstockdata = allstockdata.drop((allstockdata.loc[allstockdata[colname].isnull()]).index)
+for colname in stockdata.columns.values:
+    stockdata = stockdata.drop((stockdata.loc[stockdata[colname].isnull()]).index)
 
-print ("Checking that all missing data has been removed. Dataframe size:", allstockdata.shape[0])
-printNumMissing(allstockdata)
+print ("Checking that all missing data has been removed. Dataframe size:", stockdata.shape[0])
+printNumMissing(stockdata)
 
-plotTicker("AAPL", allstockdata)
+plotTicker("AAPL", stockdata)
 
-
+df = stockdata
 
 df = df.sort_values('date')
 
