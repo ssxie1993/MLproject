@@ -10,11 +10,19 @@ import urllib.request, json
 import os
 import numpy as np
 import tensorflow as tf # This code has been tested with TensorFlow 1.6
+import statsmodels.api as sm
+from fbprophet import Prophet
+from scipy import stats
+from pandas.core import datetools
 
 import plotly.graph_objs as go
 import plotly.offline as offl
-
-
+from plotly import tools
+import plotly.plotly as py
+import plotly.figure_factory as ff
+import plotly.graph_objs as go
+from plotly.offline import download_plotlyjs, init_notebook_mode, plot, iplot
+import warnings
 
 #Display percent of null values
 def printNumMissing(allstockdata):
@@ -34,13 +42,11 @@ def plotTicker(tickers, allstockdata):
     layout = dict(title="Closing price vs date" )
     fig = dict(data=traces, layout=layout)
     offl.plot(fig)
-    
 
 stockinfo = {}
 
 for infile in glob.glob("./stockinfo/*.csv"):
     stockinfo[infile] = pd.read_csv(infile)
-
 
 #Note: run merge.sh before this
 allstockdata = pd.read_csv("all_stocks_5yr.csv")
@@ -118,7 +124,6 @@ for ti in range(1000):
 # Used for visualization and test purposes
 all_mid_data = np.concatenate([train_data,test_data],axis=0)
 
-
 class DataGeneratorSeq(object):
 
     def __init__(self,prices,batch_size,num_unroll):
@@ -163,297 +168,570 @@ class DataGeneratorSeq(object):
         for b in range(self._batch_size):
             self._cursor[b] = np.random.randint(0,min((b+1)*self._segments,self._prices_length-1))
 
+def runLSTM():
+   dg = DataGeneratorSeq(train_data,5,5)
+   u_data, u_labels = dg.unroll_batches()
+   
+   for ui,(dat,lbl) in enumerate(zip(u_data,u_labels)):   
+       print('\n\nUnrolled index %d'%ui)
+       dat_ind = dat
+       lbl_ind = lbl
+       print('\tInputs: ',dat )
+       print('\n\tOutput:',lbl)
+       
+   D = 1 # Dimensionality of the data. Since your data is 1-D this would be 1
+   num_unrollings = 20 # Number of time steps you look into the future. The larger the better
+   batch_size = 50 # Number of samples in a batch, single time step
+   num_nodes = [200,200,150] # Number of hidden nodes in each layer of the deep LSTM stack we're using
+   n_layers = len(num_nodes) # number of layers
+   dropout = 0.2 # dropout amount to reduce overfitting and improve performance
+   
+   tf.reset_default_graph() # This is important in case you run this multiple times
+   
+   # Input data.
+   train_inputs, train_outputs = [],[]
+   
+   # You unroll the input over time defining placeholders for each time step
+   for ui in range(num_unrollings):
+       train_inputs.append(tf.placeholder(tf.float32, shape=[batch_size,D],name='train_inputs_%d'%ui))
+       train_outputs.append(tf.placeholder(tf.float32, shape=[batch_size,1], name = 'train_outputs_%d'%ui))
+       
+   lstm_cells = [
+       tf.contrib.rnn.LSTMCell(num_units=num_nodes[li],
+                               state_is_tuple=True,
+                               initializer= tf.contrib.layers.xavier_initializer()
+                              )
+    for li in range(n_layers)]
+   
+   # Defining Parameters of LSTM and Regression Layer
+   # 3 layers of LSM and a linear gression layer (w,b)
+   drop_lstm_cells = [tf.contrib.rnn.DropoutWrapper(
+       lstm, input_keep_prob=1.0,output_keep_prob=1.0-dropout, state_keep_prob=1.0-dropout
+   ) for lstm in lstm_cells]
+   
+   drop_multi_cell = tf.contrib.rnn.MultiRNNCell(drop_lstm_cells)
+   multi_cell = tf.contrib.rnn.MultiRNNCell(lstm_cells)
+   
+   w = tf.get_variable('w',shape=[num_nodes[-1], 1], initializer=tf.contrib.layers.xavier_initializer())
+   b = tf.get_variable('b',initializer=tf.random_uniform([1],-0.1,0.1))
+   
+   # Calculating LSTM output and Feeding it to the regression layer to get final prediction
+   # Create cell state and hidden state variables to maintain the state of the LSTM
+   c, h = [],[]
+   initial_state = []
+   for li in range(n_layers):
+     c.append(tf.Variable(tf.zeros([batch_size, num_nodes[li]]), trainable=False))
+     h.append(tf.Variable(tf.zeros([batch_size, num_nodes[li]]), trainable=False))
+     initial_state.append(tf.contrib.rnn.LSTMStateTuple(c[li], h[li]))
+   
+   # Do several tensor transformations, because the function dynamic_rnn requires the output to be of
+   # a specific format. Read more at: https://www.tensorflow.org/api_docs/python/tf/nn/dynamic_rnn
+   all_inputs = tf.concat([tf.expand_dims(t,0) for t in train_inputs],axis=0)
+   
+   # all_outputs is [seq_length, batch_size, num_nodes]
+   all_lstm_outputs, state = tf.nn.dynamic_rnn(
+       drop_multi_cell, all_inputs, initial_state=tuple(initial_state),
+       time_major = True, dtype=tf.float32)
+   
+   all_lstm_outputs = tf.reshape(all_lstm_outputs, [batch_size*num_unrollings,num_nodes[-1]])
+   
+   all_outputs = tf.nn.xw_plus_b(all_lstm_outputs,w,b)
+   
+   split_outputs = tf.split(all_outputs,num_unrollings,axis=0)
+   
+   ### Loss Calculation and Optimizer
+   # When calculating the loss you need to be careful about the exact form, because you calculate
+   # loss of all the unrolled steps at the same time
+   # Therefore, take the mean error or each batch and get the sum of that over all the unrolled steps
+   
+   print('Defining training Loss')
+   loss = 0.0
+   with tf.control_dependencies([tf.assign(c[li], state[li][0]) for li in range(n_layers)]+
+                                [tf.assign(h[li], state[li][1]) for li in range(n_layers)]):
+     for ui in range(num_unrollings):
+       loss += tf.reduce_mean(0.5*(split_outputs[ui]-train_outputs[ui])**2)
+   
+   print('Learning rate decay operations')
+   global_step = tf.Variable(0, trainable=False)
+   inc_gstep = tf.assign(global_step,global_step + 1)
+   tf_learning_rate = tf.placeholder(shape=None,dtype=tf.float32)
+   tf_min_learning_rate = tf.placeholder(shape=None,dtype=tf.float32)
+   
+   learning_rate = tf.maximum(
+       tf.train.exponential_decay(tf_learning_rate, global_step, decay_steps=1, decay_rate=0.5, staircase=True),
+       tf_min_learning_rate)
+   
+   # Optimizer.
+   print('TF Optimization operations')
+   optimizer = tf.train.AdamOptimizer(learning_rate)
+   gradients, v = zip(*optimizer.compute_gradients(loss))
+   gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
+   optimizer = optimizer.apply_gradients(
+       zip(gradients, v))
+   
+   print('\tAll done')
+   
+   print('Defining prediction related TF functions')
+   
+   sample_inputs = tf.placeholder(tf.float32, shape=[1,D])
+   
+   # Maintaining LSTM state for prediction stage
+   sample_c, sample_h, initial_sample_state = [],[],[]
+   for li in range(n_layers):
+     sample_c.append(tf.Variable(tf.zeros([1, num_nodes[li]]), trainable=False))
+     sample_h.append(tf.Variable(tf.zeros([1, num_nodes[li]]), trainable=False))
+     initial_sample_state.append(tf.contrib.rnn.LSTMStateTuple(sample_c[li],sample_h[li]))
+   
+   reset_sample_states = tf.group(*[tf.assign(sample_c[li],tf.zeros([1, num_nodes[li]])) for li in range(n_layers)],
+                                  *[tf.assign(sample_h[li],tf.zeros([1, num_nodes[li]])) for li in range(n_layers)])
+   
+   sample_outputs, sample_state = tf.nn.dynamic_rnn(multi_cell, tf.expand_dims(sample_inputs,0),
+                                      initial_state=tuple(initial_sample_state),
+                                      time_major = True,
+                                      dtype=tf.float32)
+   
+   with tf.control_dependencies([tf.assign(sample_c[li],sample_state[li][0]) for li in range(n_layers)]+
+                                 [tf.assign(sample_h[li],sample_state[li][1]) for li in range(n_layers)]):  
+     sample_prediction = tf.nn.xw_plus_b(tf.reshape(sample_outputs,[1,-1]), w, b)
+   
+   print('\tAll done')
+   
+   epochs = 20
+   valid_summary = 1 # Interval you make test predictions
+   
+   n_predict_once = 10 # Number of steps you continously predict for
+   
+   train_seq_length = train_data.size # Full length of the training data
+   
+   train_mse_ot = [] # Accumulate Train losses
+   test_mse_ot = [] # Accumulate Test loss
+   predictions_over_time = [] # Accumulate predictions
+   
+   session = tf.InteractiveSession()
+   
+   tf.global_variables_initializer().run()
+   
+   # Used for decaying learning rate
+   loss_nondecrease_count = 0
+   loss_nondecrease_threshold = 2 # If the test error hasn't increased in this many steps, decrease learning rate
+   
+   print('Initialized')
+   average_loss = 0
+   
+   # Define data generator
+   data_gen = DataGeneratorSeq(train_data,batch_size,num_unrollings)
+   
+   x_axis_seq = []
+   
+   # Points you start your test predictions from
+   test_points_seq = np.arange(1000,1200,50).tolist()
+   
+   for ep in range(epochs):       
+   
+       # ========================= Training =====================================
+       for step in range(train_seq_length//batch_size):
+   
+           u_data, u_labels = data_gen.unroll_batches()
+   
+           feed_dict = {}
+           for ui,(dat,lbl) in enumerate(zip(u_data,u_labels)):            
+               feed_dict[train_inputs[ui]] = dat.reshape(-1,1)
+               feed_dict[train_outputs[ui]] = lbl.reshape(-1,1)
+   
+           feed_dict.update({tf_learning_rate: 0.0001, tf_min_learning_rate:0.000001})
+   
+           _, l = session.run([optimizer, loss], feed_dict=feed_dict)
+   
+           average_loss += l
+   
+       # ============================ Validation ==============================
+       if (ep+1) % valid_summary == 0:
+   
+         average_loss = average_loss/(valid_summary*(train_seq_length//batch_size))
+   
+         # The average loss
+         if (ep+1)%valid_summary==0:
+           print('Average loss at step %d: %f' % (ep+1, average_loss))
+   
+         train_mse_ot.append(average_loss)
+   
+         average_loss = 0 # reset loss
+   
+         predictions_seq = []
+   
+         mse_test_loss_seq = []
+   
+         # ===================== Updating State and Making Predicitons ========================
+         for w_i in test_points_seq:
+           mse_test_loss = 0.0
+           our_predictions = []
+   
+           if (ep+1)-valid_summary==0:
+             # Only calculate x_axis values in the first validation epoch
+             x_axis=[]
+   
+           # Feed in the recent past behavior of stock prices
+           # to make predictions from that point onwards
+           for tr_i in range(w_i-num_unrollings+1,w_i-1):
+             current_price = all_mid_data[tr_i]
+             feed_dict[sample_inputs] = np.array(current_price).reshape(1,1)    
+             _ = session.run(sample_prediction,feed_dict=feed_dict)
+   
+           feed_dict = {}
+   
+           current_price = all_mid_data[w_i-1]
+   
+           feed_dict[sample_inputs] = np.array(current_price).reshape(1,1)
+   
+           # Make predictions for this many steps
+           # Each prediction uses previous prediciton as it's current input
+           for pred_i in range(n_predict_once):
+   
+             pred = session.run(sample_prediction,feed_dict=feed_dict)
+   
+             our_predictions.append(np.asscalar(pred))
+   
+             feed_dict[sample_inputs] = np.asarray(pred).reshape(-1,1)
+   
+             if (ep+1)-valid_summary==0:
+               # Only calculate x_axis values in the first validation epoch
+               x_axis.append(w_i+pred_i)
+   
+             mse_test_loss += 0.5*(pred-all_mid_data[w_i+pred_i])**2
+   
+           session.run(reset_sample_states)
+   
+           predictions_seq.append(np.array(our_predictions))
+   
+           mse_test_loss /= n_predict_once
+           mse_test_loss_seq.append(mse_test_loss)
+   
+           if (ep+1)-valid_summary==0:
+             x_axis_seq.append(x_axis)
+   
+         current_test_mse = np.mean(mse_test_loss_seq)
+   
+         # Learning rate decay logic
+         if len(test_mse_ot)>0 and current_test_mse > min(test_mse_ot):
+             loss_nondecrease_count += 1
+         else:
+             loss_nondecrease_count = 0
+   
+         if loss_nondecrease_count > loss_nondecrease_threshold :
+               session.run(inc_gstep)
+               loss_nondecrease_count = 0
+               print('\tDecreasing learning rate by 0.5')
+   
+         test_mse_ot.append(current_test_mse)
+         print('\tTest MSE: %.5f'%np.mean(mse_test_loss_seq))
+         predictions_over_time.append(predictions_seq)
+         print('\tFinished Predictions')
 
-
-dg = DataGeneratorSeq(train_data,5,5)
-u_data, u_labels = dg.unroll_batches()
-
-for ui,(dat,lbl) in enumerate(zip(u_data,u_labels)):   
-    print('\n\nUnrolled index %d'%ui)
-    dat_ind = dat
-    lbl_ind = lbl
-    print('\tInputs: ',dat )
-    print('\n\tOutput:',lbl)
-    
-D = 1 # Dimensionality of the data. Since your data is 1-D this would be 1
-num_unrollings = 20 # Number of time steps you look into the future. The larger the better
-batch_size = 50 # Number of samples in a batch, single time step
-num_nodes = [200,200,150] # Number of hidden nodes in each layer of the deep LSTM stack we're using
-n_layers = len(num_nodes) # number of layers
-dropout = 0.2 # dropout amount to reduce overfitting and improve performance
-
-tf.reset_default_graph() # This is important in case you run this multiple times
-
-# Input data.
-train_inputs, train_outputs = [],[]
-
-# You unroll the input over time defining placeholders for each time step
-for ui in range(num_unrollings):
-    train_inputs.append(tf.placeholder(tf.float32, shape=[batch_size,D],name='train_inputs_%d'%ui))
-    train_outputs.append(tf.placeholder(tf.float32, shape=[batch_size,1], name = 'train_outputs_%d'%ui))
-    
-lstm_cells = [
-    tf.contrib.rnn.LSTMCell(num_units=num_nodes[li],
-                            state_is_tuple=True,
-                            initializer= tf.contrib.layers.xavier_initializer()
-                           )
- for li in range(n_layers)]
-
-# Defining Parameters of LSTM and Regression Layer
-# 3 layers of LSM and a linear gression layer (w,b)
-drop_lstm_cells = [tf.contrib.rnn.DropoutWrapper(
-    lstm, input_keep_prob=1.0,output_keep_prob=1.0-dropout, state_keep_prob=1.0-dropout
-) for lstm in lstm_cells]
-
-drop_multi_cell = tf.contrib.rnn.MultiRNNCell(drop_lstm_cells)
-multi_cell = tf.contrib.rnn.MultiRNNCell(lstm_cells)
-
-w = tf.get_variable('w',shape=[num_nodes[-1], 1], initializer=tf.contrib.layers.xavier_initializer())
-b = tf.get_variable('b',initializer=tf.random_uniform([1],-0.1,0.1))
-
-# Calculating LSTM output and Feeding it to the regression layer to get final prediction
-# Create cell state and hidden state variables to maintain the state of the LSTM
-c, h = [],[]
-initial_state = []
-for li in range(n_layers):
-  c.append(tf.Variable(tf.zeros([batch_size, num_nodes[li]]), trainable=False))
-  h.append(tf.Variable(tf.zeros([batch_size, num_nodes[li]]), trainable=False))
-  initial_state.append(tf.contrib.rnn.LSTMStateTuple(c[li], h[li]))
-
-# Do several tensor transformations, because the function dynamic_rnn requires the output to be of
-# a specific format. Read more at: https://www.tensorflow.org/api_docs/python/tf/nn/dynamic_rnn
-all_inputs = tf.concat([tf.expand_dims(t,0) for t in train_inputs],axis=0)
-
-# all_outputs is [seq_length, batch_size, num_nodes]
-all_lstm_outputs, state = tf.nn.dynamic_rnn(
-    drop_multi_cell, all_inputs, initial_state=tuple(initial_state),
-    time_major = True, dtype=tf.float32)
-
-all_lstm_outputs = tf.reshape(all_lstm_outputs, [batch_size*num_unrollings,num_nodes[-1]])
-
-all_outputs = tf.nn.xw_plus_b(all_lstm_outputs,w,b)
-
-split_outputs = tf.split(all_outputs,num_unrollings,axis=0)
-
-### Loss Calculation and Optimizer
-# When calculating the loss you need to be careful about the exact form, because you calculate
-# loss of all the unrolled steps at the same time
-# Therefore, take the mean error or each batch and get the sum of that over all the unrolled steps
-
-print('Defining training Loss')
-loss = 0.0
-with tf.control_dependencies([tf.assign(c[li], state[li][0]) for li in range(n_layers)]+
-                             [tf.assign(h[li], state[li][1]) for li in range(n_layers)]):
-  for ui in range(num_unrollings):
-    loss += tf.reduce_mean(0.5*(split_outputs[ui]-train_outputs[ui])**2)
-
-print('Learning rate decay operations')
-global_step = tf.Variable(0, trainable=False)
-inc_gstep = tf.assign(global_step,global_step + 1)
-tf_learning_rate = tf.placeholder(shape=None,dtype=tf.float32)
-tf_min_learning_rate = tf.placeholder(shape=None,dtype=tf.float32)
-
-learning_rate = tf.maximum(
-    tf.train.exponential_decay(tf_learning_rate, global_step, decay_steps=1, decay_rate=0.5, staircase=True),
-    tf_min_learning_rate)
-
-# Optimizer.
-print('TF Optimization operations')
-optimizer = tf.train.AdamOptimizer(learning_rate)
-gradients, v = zip(*optimizer.compute_gradients(loss))
-gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
-optimizer = optimizer.apply_gradients(
-    zip(gradients, v))
-
-print('\tAll done')
-
-print('Defining prediction related TF functions')
-
-sample_inputs = tf.placeholder(tf.float32, shape=[1,D])
-
-# Maintaining LSTM state for prediction stage
-sample_c, sample_h, initial_sample_state = [],[],[]
-for li in range(n_layers):
-  sample_c.append(tf.Variable(tf.zeros([1, num_nodes[li]]), trainable=False))
-  sample_h.append(tf.Variable(tf.zeros([1, num_nodes[li]]), trainable=False))
-  initial_sample_state.append(tf.contrib.rnn.LSTMStateTuple(sample_c[li],sample_h[li]))
-
-reset_sample_states = tf.group(*[tf.assign(sample_c[li],tf.zeros([1, num_nodes[li]])) for li in range(n_layers)],
-                               *[tf.assign(sample_h[li],tf.zeros([1, num_nodes[li]])) for li in range(n_layers)])
-
-sample_outputs, sample_state = tf.nn.dynamic_rnn(multi_cell, tf.expand_dims(sample_inputs,0),
-                                   initial_state=tuple(initial_sample_state),
-                                   time_major = True,
-                                   dtype=tf.float32)
-
-with tf.control_dependencies([tf.assign(sample_c[li],sample_state[li][0]) for li in range(n_layers)]+
-                              [tf.assign(sample_h[li],sample_state[li][1]) for li in range(n_layers)]):  
-  sample_prediction = tf.nn.xw_plus_b(tf.reshape(sample_outputs,[1,-1]), w, b)
-
-print('\tAll done')
-
-epochs = 20
-valid_summary = 1 # Interval you make test predictions
-
-n_predict_once = 10 # Number of steps you continously predict for
-
-train_seq_length = train_data.size # Full length of the training data
-
-train_mse_ot = [] # Accumulate Train losses
-test_mse_ot = [] # Accumulate Test loss
-predictions_over_time = [] # Accumulate predictions
-
-session = tf.InteractiveSession()
-
-tf.global_variables_initializer().run()
-
-# Used for decaying learning rate
-loss_nondecrease_count = 0
-loss_nondecrease_threshold = 2 # If the test error hasn't increased in this many steps, decrease learning rate
-
-print('Initialized')
-average_loss = 0
-
-# Define data generator
-data_gen = DataGeneratorSeq(train_data,batch_size,num_unrollings)
-
-x_axis_seq = []
-
-# Points you start your test predictions from
-test_points_seq = np.arange(1000,1200,50).tolist()
-
-for ep in range(epochs):       
-
-    # ========================= Training =====================================
-    for step in range(train_seq_length//batch_size):
-
-        u_data, u_labels = data_gen.unroll_batches()
-
-        feed_dict = {}
-        for ui,(dat,lbl) in enumerate(zip(u_data,u_labels)):            
-            feed_dict[train_inputs[ui]] = dat.reshape(-1,1)
-            feed_dict[train_outputs[ui]] = lbl.reshape(-1,1)
-
-        feed_dict.update({tf_learning_rate: 0.0001, tf_min_learning_rate:0.000001})
-
-        _, l = session.run([optimizer, loss], feed_dict=feed_dict)
-
-        average_loss += l
-
-    # ============================ Validation ==============================
-    if (ep+1) % valid_summary == 0:
-
-      average_loss = average_loss/(valid_summary*(train_seq_length//batch_size))
-
-      # The average loss
-      if (ep+1)%valid_summary==0:
-        print('Average loss at step %d: %f' % (ep+1, average_loss))
-
-      train_mse_ot.append(average_loss)
-
-      average_loss = 0 # reset loss
-
-      predictions_seq = []
-
-      mse_test_loss_seq = []
-
-      # ===================== Updating State and Making Predicitons ========================
-      for w_i in test_points_seq:
-        mse_test_loss = 0.0
-        our_predictions = []
-
-        if (ep+1)-valid_summary==0:
-          # Only calculate x_axis values in the first validation epoch
-          x_axis=[]
-
-        # Feed in the recent past behavior of stock prices
-        # to make predictions from that point onwards
-        for tr_i in range(w_i-num_unrollings+1,w_i-1):
-          current_price = all_mid_data[tr_i]
-          feed_dict[sample_inputs] = np.array(current_price).reshape(1,1)    
-          _ = session.run(sample_prediction,feed_dict=feed_dict)
-
-        feed_dict = {}
-
-        current_price = all_mid_data[w_i-1]
-
-        feed_dict[sample_inputs] = np.array(current_price).reshape(1,1)
-
-        # Make predictions for this many steps
-        # Each prediction uses previous prediciton as it's current input
-        for pred_i in range(n_predict_once):
-
-          pred = session.run(sample_prediction,feed_dict=feed_dict)
-
-          our_predictions.append(np.asscalar(pred))
-
-          feed_dict[sample_inputs] = np.asarray(pred).reshape(-1,1)
-
-          if (ep+1)-valid_summary==0:
-            # Only calculate x_axis values in the first validation epoch
-            x_axis.append(w_i+pred_i)
-
-          mse_test_loss += 0.5*(pred-all_mid_data[w_i+pred_i])**2
-
-        session.run(reset_sample_states)
-
-        predictions_seq.append(np.array(our_predictions))
-
-        mse_test_loss /= n_predict_once
-        mse_test_loss_seq.append(mse_test_loss)
-
-        if (ep+1)-valid_summary==0:
-          x_axis_seq.append(x_axis)
-
-      current_test_mse = np.mean(mse_test_loss_seq)
-
-      # Learning rate decay logic
-      if len(test_mse_ot)>0 and current_test_mse > min(test_mse_ot):
-          loss_nondecrease_count += 1
-      else:
-          loss_nondecrease_count = 0
-
-      if loss_nondecrease_count > loss_nondecrease_threshold :
-            session.run(inc_gstep)
-            loss_nondecrease_count = 0
-            print('\tDecreasing learning rate by 0.5')
-
-      test_mse_ot.append(current_test_mse)
-      print('\tTest MSE: %.5f'%np.mean(mse_test_loss_seq))
-      predictions_over_time.append(predictions_seq)
-      print('\tFinished Predictions')
       
-mintest = np.argmin(test_mse_ot)
-print('\tEpoch with best Results: %d'% (mintest))
-best_prediction_epoch = mintest # replace this with the epoch that you got the best results when running the plotting code
+   mintest = np.argmin(test_mse_ot)
+   print('\tEpoch with best Results: %d'% (mintest))
+   best_prediction_epoch = mintest # replace this with the epoch that you got the best results when running the plotting code
+   
+   #plt.figure(figsize = (18,18))
+   plt.subplot(2,1,1)
+   plt.plot(range(df.shape[0]),all_mid_data,color='b')
+   
+   # Plotting how the predictions change over time
+   # Plot older predictions with low alpha and newer predictions with high alpha
+   start_alpha = 0.25
+   alpha  = np.arange(start_alpha,1.1,(1.0-start_alpha)/len(predictions_over_time[::3]))
+   for p_i,p in enumerate(predictions_over_time[::3]):
+       for xval,yval in zip(x_axis_seq,p):
+           plt.plot(xval,yval,color='r',alpha=alpha[p_i])
+   
+   plt.title('Evolution of Test Predictions Over Time',fontsize=12)
+   plt.xlabel('Date',fontsize=12)
+   plt.ylabel('Mid Price',fontsize=12)
+   plt.xlim(1000,1250)
+   
+   plt.subplot(2,1,2)
+   
+   # Predicting the best test prediction you got
+   plt.plot(range(df.shape[0]),all_mid_data,color='b')
+   for xval,yval in zip(x_axis_seq,predictions_over_time[best_prediction_epoch]):
+       plt.plot(xval,yval,color='r')
+   
+   plt.title('Best Test Predictions Over Time',fontsize=12)
+   plt.xlabel('Date',fontsize=12)
+   plt.ylabel('Mid Price',fontsize=12)
+   plt.xlim(1000,1250)
+   plt.show()      
 
-#plt.figure(figsize = (18,18))
-plt.subplot(2,1,1)
-plt.plot(range(df.shape[0]),all_mid_data,color='b')
+def runprophet():
+   # # Time Series Forecast with Prophet
+   # 
+   # ## Introduction:
+   # This is a simple kernel in which we will forecast stock prices using Prophet (Facebook's library for time series forecasting). However, historical prices are no indication whether a price will go up or down.  I'll rather use my own variables and use machine learning for stock price prediction rather than just using historical prices as an indication of stock price increase.
+   # 
+   # ## A Summary about Prophet:
+   # Facebook's research team has come up with an easier implementation of forecasting through it's new library called Prophet. From what I have read, the blog state's that analyst that can produce high quality forecasting data is rarely seen. This is one of the reasons why Facebook's research team came to an easily approachable way for using advanced concepts for time series forecasting and us Python users, can easily relate to this library since it uses Scikit-Learn's api (Similar to Scikit-Learn). To gain further information, you can look at  [Prophet Blog](https://research.fb.com/prophet-forecasting-at-scale/). Prophet's team main goal is to <b>to make it easier for experts and non-experts to make high quality forecasts that keep up with demand. </b> <br><br>
+   # 
+   # There are several characteristics of Prophet (you can see it in the blog) that I want to share with you Kaggles that shows where Prophet works best:
+   # <ul>
+   # <li>hourly, daily, or weekly observations with at least a few months (preferably a year) of history </li>
+   # <li>strong multiple “human-scale” seasonalities: day of week and time of year </li>
+   # <li>Important holidays that occur at irregular intervals that are known in advance (e.g. the Super Bowl) </li>
+   # <li>A reasonable number of missing observations or large outliers </li>
+   # <li>Historical trend changes, for instance due to product launches or logging changes </li>
+   # <li>Trends that are non-linear growth curves, where a trend hits a natural limit or saturates </li>
+   # </ul>
+   # <br><br>
+   
+   # Import Libraries
+   # Statsmodels widely known for forecasting than Prophet
+   init_notebook_mode(connected=True)
+   warnings.filterwarnings("ignore")
+   
+   # plt.style.available
+   plt.style.use("seaborn-whitegrid")
+   
 
-# Plotting how the predictions change over time
-# Plot older predictions with low alpha and newer predictions with high alpha
-start_alpha = 0.25
-alpha  = np.arange(start_alpha,1.1,(1.0-start_alpha)/len(predictions_over_time[::3]))
-for p_i,p in enumerate(predictions_over_time[::3]):
-    for xval,yval in zip(x_axis_seq,p):
-        plt.plot(xval,yval,color='r',alpha=alpha[p_i])
+   df = pd.read_csv('./all_stocks_5yr.csv')
+   
 
-plt.title('Evolution of Test Predictions Over Time',fontsize=12)
-plt.xlabel('Date',fontsize=12)
-plt.ylabel('Mid Price',fontsize=12)
-plt.xlim(1000,1250)
+   # Brief Description of our dataset
+   df.describe()
+   
 
-plt.subplot(2,1,2)
+   # Replace the column name from name to ticks
+   df = df.rename(columns={'Name': 'Ticks'})
+   
+   # For this simple tutorial we will analyze Amazon's stock and see what will the trend look like for the nearby future of this stock relying on past stock prices.
+   # Let's analyze some of the stocks.
+   amzn = df.loc[df['Ticks'] == 'AMZN']
+   
+   # We need to make sure if the date column is either a categorical type or a datetype. In our case date is a categorical datatype so we need to change it to datetime.
+   
+   amzn.info() # Check whether the date is as object type or date type
+   
+   # Create a copy to avoid the SettingWarning .loc issue 
+   amzn_df = amzn.copy()
+   # Change to datetime datatype.
+   amzn_df.loc[:, 'date'] = pd.to_datetime(amzn.loc[:,'date'], format="%Y/%m/%d")
+   
+   amzn_df.info()
+   
+   # Simple plotting of Amazon Stock Price
+   # First Subplot
+   f, (ax1, ax2) = plt.subplots(1, 2, figsize=(14,5))
+   ax1.plot(amzn_df["date"], amzn_df["close"])
+   ax1.set_xlabel("Date", fontsize=12)
+   ax1.set_ylabel("Stock Price")
+   ax1.set_title("Amazon Close Price History")
+   
+   # Second Subplot
+   ax1.plot(amzn_df["date"], amzn_df["high"], color="green")
+   ax1.set_xlabel("Date", fontsize=12)
+   ax1.set_ylabel("Stock Price")
+   ax1.set_title("Amazon High Price History")
+   
+   # Third Subplot
+   ax1.plot(amzn_df["date"], amzn_df["low"], color="red")
+   ax1.set_xlabel("Date", fontsize=12)
+   ax1.set_ylabel("Stock Price")
+   ax1.set_title("Amazon Low Price History")
+   
+   # Fourth Subplot
+   ax2.plot(amzn_df["date"], amzn_df["volume"], color="orange")
+   ax2.set_xlabel("Date", fontsize=12)
+   ax2.set_ylabel("Stock Price")
+   ax2.set_title("Amazon's Volume History")
+   plt.show()
+   
+   # ### Prophet Introduction:
+   # Prophet is Facebook's library for time series forecasting. In my opinion, Prophet works best with datasets that are higely influenced by seasonality (electricity bills, restaurant visitors etc.) However, I wanted to show the simplicity of using Prophet for simple forecasting which is the main aim of this kernel.
+   # 
+   # #### Steps for using Prophet:
+   # <ul>
+   # <li>Make sure you replace closing price for y and date for ds. </li>
+   # <li>Fit that dataframe to Prophet in order to detect future patterns. </li>
+   # <li>Predict the upper and lower prices of the closing price. </li>
+   # </ul>
+   
+   m = Prophet()
+   
+   # Drop the columns
+   ph_df = amzn_df.drop(['open', 'high', 'low','volume', 'Ticks'], axis=1)
+   ph_df.rename(columns={'close': 'y', 'date': 'ds'}, inplace=True)
+   
+   m = Prophet()
+   m.fit(ph_df)
+   
+   # Create Future dates
+   future_prices = m.make_future_dataframe(periods=365)
+   
+   # Predict Prices
+   forecast = m.predict(future_prices)
+   forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail()
+   
+   import matplotlib.dates as mdates
+   
+   # Dates
+   starting_date = dt.datetime(2018, 4, 7)
+   starting_date1 = mdates.date2num(starting_date)
+   trend_date = dt.datetime(2018, 6, 7)
+   trend_date1 = mdates.date2num(trend_date)
+   
+   pointing_arrow = dt.datetime(2018, 2, 18)
+   pointing_arrow1 = mdates.date2num(pointing_arrow)
+   
+   # Learn more Prophet tomorrow and plot the forecast for amazon.
+   fig = m.plot(forecast)
+   ax1 = fig.add_subplot(111)
+   ax1.set_title("Amazon Stock Price Forecast", fontsize=16)
+   ax1.set_xlabel("Date", fontsize=12)
+   ax1.set_ylabel("Close Price", fontsize=12)
+   
+   # Forecast initialization arrow
+   ax1.annotate('Forecast \n Initialization', xy=(pointing_arrow1, 1350), xytext=(starting_date1,1700),
+               arrowprops=dict(facecolor='#ff7f50', shrink=0.1),
+               )
+   
+   # Trend emphasis arrow
+   ax1.annotate('Upward Trend', xy=(trend_date1, 1225), xytext=(trend_date1,950),
+               arrowprops=dict(facecolor='#6cff6c', shrink=0.1),
+               )
+   
+   ax1.axhline(y=1260, color='b', linestyle='-')
+   
+   plt.show()
+   
+   fig2 = m.plot_components(forecast)
+   plt.show()
+   
+   # Monthly Data Predictions
+   m = Prophet(changepoint_prior_scale=0.01).fit(ph_df)
+   future = m.make_future_dataframe(periods=12, freq='M')
+   fcst = m.predict(future)
+   fig = m.plot(fcst)
+   plt.title("Monthly Prediction \n 1 year time frame")
+   
+   plt.show()
+   
+   
+   # #### Trends:
+   # <ul> 
+   # <li>Amazon's stock price is showing signs of upper trend yearly. </li>
+   # <li> Amazon's stock price show upper trend signs during January (December Sales tend to give a boost to Amazon's stock price)</li>
+   # <li>There is no weekly trend for stock prices. </li>
+   # </ul>
+   
 
-# Predicting the best test prediction you got
-plt.plot(range(df.shape[0]),all_mid_data,color='b')
-for xval,yval in zip(x_axis_seq,predictions_over_time[best_prediction_epoch]):
-    plt.plot(xval,yval,color='r')
+   
+   fig = m.plot_components(fcst)
+   plt.show()
+   
+   # ### Stocks more Susceptible to Seasonality Trends:
+   # ---> Description Later:
+   # American Airlines
+   aal_df = df.loc[df["Ticks"] == "AAL"]
+   
+   aal_df.loc[:, 'date'] = pd.to_datetime(aal_df.loc[:,'date'], format="%Y/%m/%d")
+   
+   aal_df.info()
+   
+   f, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18,5))
+   
+   aal_df["close_log"] = np.log(aal_df["close"])
+   aal_df["high_log"] = np.log(aal_df["high"])
+   aal_df["low_log"] = np.log(aal_df["low"])
+   
+   ax1.plot(aal_df["date"], aal_df["close_log"])
+   ax1.set_title("Normalized Close Price")
+   ax2.plot(aal_df["date"], aal_df["high_log"], color="g")
+   ax2.set_title("Normalized High Price")
+   ax3.plot(aal_df["date"], aal_df["low_log"], color="r")
+   ax3.set_title("Normalized Low Price")
+   plt.show()
+   
+   aal_df['std_close'] = aal_df["close"].rolling(5).std()
+   aal_df['mean_close'] = aal_df["close"].rolling(5).mean()
+   aal_df['twenty_mean_close'] = aal_df["close"].rolling(20).mean()
+   
+   f, (std_ax, avg_ax) = plt.subplots(1, 2, figsize=(18,5))
+   
+   std_ax.plot(aal_df["date"], aal_df["std_close"], color="r", label="Standard Deviation")
+   std_ax.legend(loc="upper left")
+   std_ax.set_title("Standard Deviation American Airlines \n (AAL)")
+   
+   avg_ax.plot(aal_df["date"], aal_df["mean_close"], color="g", label="5-day MA")
+   avg_ax.plot(aal_df["date"], aal_df["twenty_mean_close"], color="k", label="20-day MA")
+   avg_ax.legend(loc="upper left")
+   avg_ax.set_title("5 Day Average AAL \n Closing Price")
+   plt.show()
+   
+   m = Prophet()
+   
+   # Drop the columns
+   ph_df = aal_df.drop(['open', 'high', 'low','volume', 'Ticks', 'close_log', 'high_log', 'mean_close', 'twenty_mean_close', 'low_log', 'std_close'], axis=1)
+   ph_df.rename(columns={'close': 'y', 'date': 'ds'}, inplace=True)
+   
+   m.fit(ph_df)
+   
+   future_prices = m.make_future_dataframe(periods=365)
+   
+   # Predict Prices
+   forecast = m.predict(future_prices)
+   forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail()
+   
+   # Dates
+   starting_date = dt.datetime(2018, 4, 7)
+   starting_date1 = mdates.date2num(starting_date)
+   trend_date = dt.datetime(2018, 2, 7)
+   trend_date1 = mdates.date2num(trend_date)
+   
+   pointing_arrow = dt.datetime(2018, 2, 18)
+   pointing_arrow1 = mdates.date2num(pointing_arrow)
+   
+   # Dates Forecasting Resistance Line
+   resistance_date = dt.datetime(2016, 4, 7)
+   resistance_date1 = mdates.date2num(resistance_date)
+   
+   # Dates Forecasting Support Line
+   support_date = dt.datetime(2013, 4, 7)
+   support_date1 = mdates.date2num(support_date)
+   
+   # Learn more Prophet tomorrow and plot the forecast for amazon.
+   fig = m.plot(forecast)
+   ax1 = fig.add_subplot(111)
+   ax1.set_title("American Airlines Stock Price Forecast", fontsize=16)
+   ax1.set_xlabel("Date", fontsize=12)
+   ax1.set_ylabel("Close Price", fontsize=12)
+   
+   # Forecast initialization arrow
+   ax1.annotate('Forecast \n Initialization', xy=(pointing_arrow1, 55), xytext=(starting_date1,40),
+               arrowprops=dict(facecolor='#ff7f50', shrink=0.1),
+               )
+   
+   # # Trend emphasis arrow
+   ax1.annotate('Last Closing Price \n Before Forecast \n ($51.40)', xy=(trend_date1, 57), xytext=(trend_date1,70),
+               arrowprops=dict(facecolor='#6cff6c', shrink=0.1),
+               )
+   
+   # Resistance Line
+   ax1.annotate('Resistance Line \n of Forecast Peak ${:.2f}'.format(forecast["yhat"].max()), xy=(resistance_date1, 65), xytext=(resistance_date1,73),
+               arrowprops=dict(facecolor='#FF0000', shrink=0.1),
+               )
+   
+   # Support Line
+   ax1.annotate('Support Line \n of Forecast Bottom \n $51.40', xy=(support_date1, 53), xytext=(support_date1,40),
+               arrowprops=dict(facecolor='#00FF40', shrink=0.1),
+               )
+   
+   ax1.axhline(y=65, color='r', linestyle='--')
+   ax1.axhline(y=54.2, color='g', linestyle='--')
+   
+   plt.show()
+   
+   fig2 = m.plot_components(forecast)
+   plt.show()
+   
+#####END PROPHET
 
-plt.title('Best Test Predictions Over Time',fontsize=12)
-plt.xlabel('Date',fontsize=12)
-plt.ylabel('Mid Price',fontsize=12)
-plt.xlim(1000,1250)
-plt.show()      
-
+runLSTM()
+runprophet()
