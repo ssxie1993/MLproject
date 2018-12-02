@@ -59,22 +59,7 @@ def preprocessdata():
    print ("Checking that all missing data has been removed. Dataframe size:", allstockdata.shape[0])
    printNumMissing(allstockdata)
    
-   #plotTicker("GOOG,AAL", allstockdata)
-   
-   stockdata = allstockdata[allstockdata.Name == "AAPL"]
-   #print (allstockdata)
-   
-   print ("Analyzing all missing stock data. Dataframe size:", stockdata.shape[0])
-   printNumMissing(stockdata)
-   
-   #drops indexes of all stock data that shows null
-   for colname in stockdata.columns.values:
-       stockdata = stockdata.drop((stockdata.loc[stockdata[colname].isnull()]).index)
-   
-   print ("Checking that all missing data has been removed. Dataframe size:", stockdata.shape[0])
-   printNumMissing(stockdata)
-   return stockdata
-   #plotTicker("AAPL", stockdata)
+   return allstockdata
 
 #Create a function to process the data into "step" day look back slices
 def processData(data,lb):
@@ -88,35 +73,21 @@ def runLSTM(ticker, data, epochs):
 
 #   plotTicker(ticker, data)
    #plotTicker("GOOGL", data)
-   print ("DEBUG: alldata in runLSTM:")
-   print (data.head())
    data = pd.read_csv("./all_stocks_5yr.csv")
-#   stock1 = data.loc[data['Name'] == 'AMZN']
-   stock1 = data[data['Name']== 'AMZN'].close
-   #cl_stock2 = data[data['Name']=='GOOGL'].close
+   stock1 = data[data['Name']== ticker].close
    scl = MinMaxScaler()
    #Scale the data
    stock1= np.array(stock1)
    stock1 = stock1.reshape(stock1.shape[0],1)
-#   print (stock1.head())
    stock1 = scl.fit_transform(stock1)
 
    step = 60
    X,y = processData(stock1,step)
-   #X_stock2,y_stock2 = processData(cl_stock2,step)
    split = 0.8
-   #X_train,X_test = X[:int(X.shape[0]*0.80)],X[int(X.shape[0]*0.80):]
    X_train = X[:int(X.shape[0]*split)]
    y_train = y[:int(y.shape[0]*split)]
    X_test = X[int(X.shape[0]*split):]
    y_test = y[int(y.shape[0]*split):]
-   #print(X_train.shape[0])
-   #print(X_test.shape[0])
-   #print(y_train.shape[0])
-   #print(y_test.shape[0])
-   
-   #X_test = X_stock2[:int(X_stock2.shape[0]*split)]
-   #y_test = y_stock2[:int(y_stock2.shape[0]*split)]
    
    print(X_train.shape[0])
    print(X_test.shape[0])
@@ -125,7 +96,6 @@ def runLSTM(ticker, data, epochs):
    
    #Build the model
    model = Sequential()
-   #model.add(LSTM(256,input_shape=(1,step)))
    model.add(LSTM(256,input_shape=(step,1)))
    model.add(Dense(1))
    model.compile(optimizer='adam',loss='mse')
@@ -137,7 +107,6 @@ def runLSTM(ticker, data, epochs):
    
    plt.plot(history.history['loss'])
    plt.plot(history.history['val_loss'])
-   #plt.title('AMZN: Train 80%, Test 20%')
    plt.xlabel('epochs')
    plt.ylabel('loss')
    plt.legend(['train','validation'])
@@ -149,7 +118,7 @@ def runLSTM(ticker, data, epochs):
    plt.plot(scl.inverse_transform(Xt))
    plt.show() 
 
-def runprophet():
+def runprophet(df, ticker):
    # # Time Series Forecast with Prophet
    # 
    # ## Introduction:
@@ -177,9 +146,6 @@ def runprophet():
    # plt.style.available
    plt.style.use("seaborn-whitegrid")
 
-   df = pd.read_csv('./all_stocks_5yr.csv')
-   
-
    # Brief Description of our dataset
    df.describe()
    
@@ -188,19 +154,11 @@ def runprophet():
    df = df.rename(columns={'Name': 'Ticks'})
    
    # For this simple tutorial we will analyze Amazon's stock and see what will the trend look like for the nearby future of this stock relying on past stock prices.
-   # Let's analyze some of the stocks.
-   amzn = df.loc[df['Ticks'] == 'AMZN']
-   
-   # We need to make sure if the date column is either a categorical type or a datetype. In our case date is a categorical datatype so we need to change it to datetime.
-   
-   amzn.info() # Check whether the date is as object type or date type
-   
+   amzn = df.loc[df['Ticks'] == ticker]
    # Create a copy to avoid the SettingWarning .loc issue 
    amzn_df = amzn.copy()
    # Change to datetime datatype.
    amzn_df.loc[:, 'date'] = pd.to_datetime(amzn.loc[:,'date'], format="%Y/%m/%d")
-   
-   amzn_df.info()
    
    # Simple plotting of Amazon Stock Price
    # First Subplot
@@ -420,6 +378,6 @@ def runprophet():
 #####END PROPHET
 
 stockdata = preprocessdata()
-print ("DEBUG: stockdata:", stockdata)
+#print ("DEBUG: stockdata size:", stockdata.shape[0])
 runLSTM("AMZN", stockdata, 30)
-runprophet()
+runprophet(stockdata, "AMZN")
